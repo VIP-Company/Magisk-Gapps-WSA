@@ -117,7 +117,7 @@ jobs:
           ROOT_SOL: ${{ github.event.inputs.root_sol }}
         run: |
           git update-index --chmod=+x ./scripts/modded_run.sh
-          ./scripts/modded_run.sh
+          sudo ./scripts/modded_run.sh
           path=$(find ./output -name "*.7z"|head -n 1)
           echo "path=$path" >> $GITHUB_OUTPUT
           echo "name=$(basename $path)" >> $GITHUB_OUTPUT
