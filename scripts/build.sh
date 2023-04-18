@@ -38,8 +38,7 @@ SYSTEM_MNT="$ROOT_MNT/system"
 VENDOR_MNT="$ROOT_MNT/vendor"
 PRODUCT_MNT="$ROOT_MNT/product"
 SYSTEM_EXT_MNT="$ROOT_MNT/system_ext"
-SUDO=""
-command -v sudo >/dev/null 2>&1 && SUDO="$(which sudo 2>/dev/null)"
+SUDO="$(which sudo 2>/dev/null)"
 DOWNLOAD_DIR=../download
 DOWNLOAD_CONF_NAME=download.list
 umount_clean() {
@@ -372,14 +371,11 @@ RELEASE_NAME=${RELEASE_NAME_MAP[$RELEASE_TYPE]} || abort
 echo -e "Build: RELEASE_TYPE=$RELEASE_NAME"
 
 WSA_ZIP_PATH=$DOWNLOAD_DIR/wsa-$RELEASE_TYPE.zip
-vclibs_PATH="$DOWNLOAD_DIR/Microsoft.VCLibs.$ARCH.14.00.Desktop.appx"
-xaml_PATH="$DOWNLOAD_DIR/Microsoft.UI.Xaml_$ARCH.appx"
+vclibs_PATH="$DOWNLOAD_DIR/Microsoft.VCLibs.140.00_$ARCH.appx"
+UWPVCLibs_PATH="$DOWNLOAD_DIR/Microsoft.VCLibs.140.00.UWPDesktop_$ARCH.appx"
+xaml_PATH="$DOWNLOAD_DIR/Microsoft.UI.Xaml.2.8_$ARCH.appx"
 MAGISK_ZIP=magisk-$MAGISK_VER.zip
 MAGISK_PATH=$DOWNLOAD_DIR/$MAGISK_ZIP
-KERNEL_VER="5.10.117.2" # TODO: Get from kernel
-KERNELSU_ZIP_NAME=kernelsu-$ARCH-$KERNEL_VER.zip
-KERNELSU_PATH=$DOWNLOAD_DIR/$KERNELSU_ZIP_NAME
-KERNELSU_INFO="$KERNELSU_PATH.info"
 if [ "$CUSTOM_MAGISK" ]; then
     if [ ! -f "$MAGISK_PATH" ]; then
         echo "Custom Magisk $MAGISK_ZIP not found"
@@ -402,7 +398,19 @@ update_gapps_zip_name() {
     fi
     GAPPS_PATH=$DOWNLOAD_DIR/$GAPPS_ZIP_NAME
 }
+DOWN_WSA_MAIN_VERSION=0
+update_ksu_zip_name() {
+    if [ "$DOWN_WSA_MAIN_VERSION" -lt "2303" ]; then
+        KERNEL_VER="5.10.117.2"
+    else
+        KERNEL_VER="5.15.78.1"
+    fi
+    KERNELSU_ZIP_NAME=kernelsu-$ARCH-$KERNEL_VER.zip
+    KERNELSU_PATH=$DOWNLOAD_DIR/$KERNELSU_ZIP_NAME
+    KERNELSU_INFO="$KERNELSU_PATH.info"
+}
 update_gapps_zip_name
+update_ksu_zip_name
 if [ -z ${OFFLINE+x} ]; then
     require_su
     if [ "$DOWN_WSA" != "no" ]; then
@@ -416,6 +424,9 @@ if [ -z ${OFFLINE+x} ]; then
     if [[ "$DOWN_WSA_MAIN_VERSION" -lt 2211 ]]; then
         ANDROID_API=32
         update_gapps_zip_name
+    fi
+    if [[ "$DOWN_WSA_MAIN_VERSION" -ge 2303 ]]; then
+        update_ksu_zip_name
     fi
     if [ "$ROOT_SOL" = "magisk" ] || [ "$GAPPS_BRAND" != "none" ]; then
         if [ -z ${CUSTOM_MAGISK+x} ]; then
@@ -444,7 +455,10 @@ else # Offline mode
         ANDROID_API=32
         update_gapps_zip_name
     fi
-    declare -A FILES_CHECK_LIST=([WSA_ZIP_PATH]="$WSA_ZIP_PATH" [xaml_PATH]="$xaml_PATH" [vclibs_PATH]="$vclibs_PATH")
+    if [[ "$DOWN_WSA_MAIN_VERSION" -ge 2303 ]]; then
+        update_ksu_zip_name
+    fi
+    declare -A FILES_CHECK_LIST=([WSA_ZIP_PATH]="$WSA_ZIP_PATH" [xaml_PATH]="$xaml_PATH" [vclibs_PATH]="$vclibs_PATH" [UWPVCLibs_PATH]="$UWPVCLibs_PATH")
     if [ "$GAPPS_BRAND" != "none" ] || [ "$ROOT_SOL" = "magisk" ]; then
         FILES_CHECK_LIST+=(["MAGISK_PATH"]="$MAGISK_PATH")
     fi
@@ -494,8 +508,8 @@ if [ "$GAPPS_BRAND" != "none" ] || [ "$ROOT_SOL" = "magisk" ]; then
         fi
         # shellcheck disable=SC1090
         source "$WSA_WORK_ENV" || abort
-        if [ "$MAGISK_VERSION_CODE" -lt 24000 ]; then
-            echo "Please install Magisk v24+"
+        if [ "$MAGISK_VERSION_CODE" -lt 25211 ] && [ "$MAGISK_VER" != "stable" ] && [ -z ${CUSTOM_MAGISK+x} ]; then
+            echo "Please install Magisk 25211+"
             abort
         fi
         "$SUDO" chmod +x "../linker/$HOST_ARCH/linker64" || abort
@@ -688,16 +702,14 @@ on post-fs-data
     mkdir /dev/$MAGISK_TMP_PATH/.magisk/mirror 0
     mkdir /dev/$MAGISK_TMP_PATH/.magisk/block 0
     mkdir /dev/$MAGISK_TMP_PATH/.magisk/worker 0
-    mkdir /dev/$MAGISK_TMP_PATH/.magisk/sepolicy.rules 0
     copy /sbin/magisk.apk /dev/$MAGISK_TMP_PATH/stub.apk
     chmod 0644 /dev/$MAGISK_TMP_PATH/stub.apk
     rm /dev/.magisk_unblock
     exec_start $LOAD_POLICY_SVC_NAME
     start $PFD_SVC_NAME
-    mkdir /data/adb/modules 700
-    mount none /data/adb/modules /dev/$MAGISK_TMP_PATH/.magisk/sepolicy.rules bind
     wait /dev/.magisk_unblock 40
     rm /dev/.magisk_unblock
+    exec u:r:magisk:s0 0 0 -- /system/bin/mknod -m 0600 /dev/$MAGISK_TMP_PATH/.magisk/block/preinit b 8 0
 
 service $LOAD_POLICY_SVC_NAME /system/bin/sh /sbin/loadpolicy.sh
     user root
@@ -835,6 +847,7 @@ fi
 echo "Remove signature and add scripts"
 $SUDO rm -rf "${WORK_DIR:?}"/wsa/"$ARCH"/\[Content_Types\].xml "$WORK_DIR/wsa/$ARCH/AppxBlockMap.xml" "$WORK_DIR/wsa/$ARCH/AppxSignature.p7x" "$WORK_DIR/wsa/$ARCH/AppxMetadata" || abort
 cp "$vclibs_PATH" "$xaml_PATH" "$WORK_DIR/wsa/$ARCH" || abort
+cp "$UWPVCLibs_PATH" "$xaml_PATH" "$WORK_DIR/wsa/$ARCH" || abort
 cp "../bin/$ARCH/makepri.exe" "$WORK_DIR/wsa/$ARCH" || abort
 cp "../xml/priconfig.xml" "$WORK_DIR/wsa/$ARCH/xml/" || abort
 cp ../installer/MakePri.ps1 "$WORK_DIR/wsa/$ARCH" || abort
