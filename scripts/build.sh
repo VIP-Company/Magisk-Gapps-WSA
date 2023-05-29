@@ -40,6 +40,13 @@ VENDOR_MNT_RO="$ROOT_MNT_RO/vendor"
 PRODUCT_MNT_RO="$ROOT_MNT_RO/product"
 SYSTEM_EXT_MNT_RO="$ROOT_MNT_RO/system_ext"
 
+# upperdir
+ROOT_MNT_RW="$WORK_DIR/upper"
+VENDOR_MNT_RW="$ROOT_MNT_RW/vendor"
+PRODUCT_MNT_RW="$ROOT_MNT_RW/product"
+SYSTEM_EXT_MNT_RW="$ROOT_MNT_RW/system_ext"
+SYSTEM_MNT_RW="$ROOT_MNT_RW/system"
+
 # merged
 ROOT_MNT="$WORK_DIR/system_root_merged"
 SYSTEM_MNT="$ROOT_MNT/system"
@@ -48,18 +55,23 @@ PRODUCT_MNT="$ROOT_MNT/product"
 SYSTEM_EXT_MNT="$ROOT_MNT/system_ext"
 
 declare -A LOWER_PARTITION=(["zsystem"]="$ROOT_MNT_RO" ["vendor"]="$VENDOR_MNT_RO" ["product"]="$PRODUCT_MNT_RO" ["system_ext"]="$SYSTEM_EXT_MNT_RO")
+declare -A UPPER_PARTITION=(["zsystem"]="$SYSTEM_MNT_RW" ["vendor"]="$VENDOR_MNT_RW" ["product"]="$PRODUCT_MNT_RW" ["system_ext"]="$SYSTEM_EXT_MNT_RW")
 declare -A MERGED_PARTITION=(["zsystem"]="$ROOT_MNT" ["vendor"]="$VENDOR_MNT" ["product"]="$PRODUCT_MNT" ["system_ext"]="$SYSTEM_EXT_MNT")
 DOWNLOAD_DIR=../download
 DOWNLOAD_CONF_NAME=download.list
 PYTHON_VENV_DIR="$(dirname "$PWD")/python3-env"
+EROFS_USE_FUSE=1
 umount_clean() {
     if [ -d "$ROOT_MNT" ] || [ -d "$ROOT_MNT_RO" ]; then
         echo "Cleanup Mount Directory"
         for PART in "${LOWER_PARTITION[@]}"; do
-            [ -d "$PART" ] && sudo umount -v "$PART"
+            sudo umount -v "$PART"
+        done
+        for PART in "${UPPER_PARTITION[@]}"; do
+            sudo rm -rf "${PART:?}"
         done
         for PART in "${MERGED_PARTITION[@]}"; do
-            [ -d "$PART" ] && sudo umount -v "$PART"
+            sudo umount -v "$PART"
         done
         sudo rm -rf "${WORK_DIR:?}"
     else
@@ -71,7 +83,7 @@ umount_clean() {
         unset TMPDIR
     fi
     rm -f "${DOWNLOAD_DIR:?}/$DOWNLOAD_CONF_NAME"
-    if [ "$(which python)" == "$PYTHON_VENV_DIR/bin/python" ]; then
+    if [ "$(python3 -c 'import sys ; print( 1 if sys.prefix != sys.base_prefix else 0 )')" = "1" ]; then
         echo "deactivate python3 venv"
         deactivate
     fi
@@ -101,6 +113,7 @@ clean_download() {
     fi
 }
 abort() {
+    [ "$1" ] && echo -e "ERROR: $1"
     echo "Build: an error has occurred, exit"
     if [ -d "$WORK_DIR" ]; then
         echo -e "\nCleanup Work Directory"
@@ -145,27 +158,20 @@ vhdx_to_raw_img() {
     rm -f "$1" || return 1
 }
 
-mk_overlayfs() {
-    local lowerdir="$1"
-    local upperdir workdir merged context own
-    merged="$3"
-    case "$2" in
-        system)
-            upperdir="$WORK_DIR/upper/$2"
-            workdir="$WORK_DIR/worker/$2"
-            ;;
-        *)
-            upperdir="$WORK_DIR/upper/system/$2"
-            workdir="$WORK_DIR/worker/system/$2"
-            ;;
-    esac
-    echo "mk_overlayfs: label $2
+mk_overlayfs() { # label lowerdir upperdir merged
+    local context own
+    local workdir="$WORK_DIR/worker/$1"
+    local lowerdir="$2"
+    local upperdir="$3"
+    local merged="$4"
+
+    echo "mk_overlayfs: label $1
         lowerdir=$lowerdir
         upperdir=$upperdir
         workdir=$workdir
         merged=$merged"
     sudo mkdir -p -m 755 "$workdir" "$upperdir" "$merged"
-    case "$2" in
+    case "$1" in
         vendor)
             context="u:object_r:vendor_file:s0"
             own="0:2000"
@@ -183,14 +189,17 @@ mk_overlayfs() {
     sudo setfattr -n security.selinux -v "$context" "$upperdir"
     sudo setfattr -n security.selinux -v "$context" "$workdir"
     sudo setfattr -n security.selinux -v "$context" "$merged"
-    sudo mount -vt overlay overlay -ouserxattr,lowerdir="$lowerdir",upperdir="$upperdir",workdir="$workdir" "$merged"
+    sudo mount -vt overlay overlay -olowerdir="$lowerdir",upperdir="$upperdir",workdir="$workdir" "$merged"
 }
 
-mk_erofs_umount() {
-    sudo mkfs.erofs -zlz4hc -T1230768000 --chunksize=4096 --exclude-regex="lost+found" "$2".erofs "$1" || abort "Failed to make erofs image from $1"
+mk_erofs_umount() { # dir imgpath upperdir
+    sudo "../bin/$HOST_ARCH/mkfs.erofs" -zlz4hc -T1230768000 --chunksize=4096 --exclude-regex="lost+found" "$2".erofs "$1" || abort "Failed to make erofs image from $1"
     sudo umount -v "$1"
     sudo rm -f "$2"
     sudo mv "$2".erofs "$2"
+    if [ "$3" ]; then
+        sudo rm -rf "$3"
+    fi
 }
 
 ro_ext4_img_to_rw() {
@@ -198,6 +207,14 @@ ro_ext4_img_to_rw() {
     e2fsck -fp -E unshare_blocks "$1" || return 1
     resize_img "$1" || return 1
     return 0
+}
+
+mount_erofs() {
+    if [ "$EROFS_USE_FUSE" ]; then
+        sudo "../bin/$HOST_ARCH/fuse.erofs" "$1" "$2" || return 1
+    else
+        sudo mount -v -t erofs -o ro,loop "$1" "$2" || return 1
+    fi
 }
 
 # workaround for Debian
@@ -419,8 +436,7 @@ fi
 require_su() {
     if test "$(id -u)" != "0"; then
         if [ "$(sudo id -u)" != "0" ]; then
-            echo "ROOT/SUDO is required to run this script"
-            abort
+            abort "sudo is required to run this script"
         fi
     fi
 }
@@ -447,8 +463,7 @@ if [ "$CUSTOM_MAGISK" ]; then
         echo "Fallback to $MAGISK_ZIP"
         MAGISK_PATH=$DOWNLOAD_DIR/$MAGISK_ZIP
         if [ ! -f "$MAGISK_PATH" ]; then
-            echo -e "Custom Magisk $MAGISK_ZIP not found\nPlease put custom Magisk in $DOWNLOAD_DIR"
-            abort
+            abort "Custom Magisk $MAGISK_ZIP not found\nPlease put custom Magisk in $DOWNLOAD_DIR"
         fi
     fi
 fi
@@ -464,17 +479,17 @@ update_gapps_zip_name() {
 }
 WSA_MAIN_VER=0
 update_ksu_zip_name() {
-    if [ "$WSA_MAIN_VER" -lt "2303" ]; then
-        KERNEL_VER="5.10.117.2"
-    else
+    KERNEL_VER="5.10.117.2"
+    if [ "$WSA_MAIN_VER" -ge "2303" ]; then
         KERNEL_VER="5.15.78.1"
+    fi
+    if [ "$WSA_MAIN_VER" -ge "2304" ]; then
+        KERNEL_VER="5.15.94.1"
     fi
     KERNELSU_ZIP_NAME=kernelsu-$ARCH-$KERNEL_VER.zip
     KERNELSU_PATH=$DOWNLOAD_DIR/$KERNELSU_ZIP_NAME
     KERNELSU_INFO="$KERNELSU_PATH.info"
 }
-update_gapps_zip_name
-update_ksu_zip_name
 if [ -z ${OFFLINE+x} ]; then
     require_su
     if [ "$DOWN_WSA" != "no" ]; then
@@ -487,10 +502,6 @@ if [ -z ${OFFLINE+x} ]; then
     fi
     if [[ "$WSA_MAIN_VER" -lt 2211 ]]; then
         ANDROID_API=32
-        update_gapps_zip_name
-    fi
-    if [[ "$WSA_MAIN_VER" -ge 2303 ]]; then
-        update_ksu_zip_name
     fi
     if [ "$ROOT_SOL" = "magisk" ] || [ "$GAPPS_BRAND" != "none" ]; then
         if [ -z ${CUSTOM_MAGISK+x} ]; then
@@ -498,6 +509,7 @@ if [ -z ${OFFLINE+x} ]; then
         fi
     fi
     if [ "$ROOT_SOL" = "kernelsu" ]; then
+        update_ksu_zip_name
         python3 generateKernelSULink.py "$ARCH" "$DOWNLOAD_DIR" "$DOWNLOAD_CONF_NAME" "$KERNEL_VER" "$KERNELSU_ZIP_NAME" || abort
         # shellcheck disable=SC1090
         source "$WSA_WORK_ENV" || abort
@@ -505,6 +517,7 @@ if [ -z ${OFFLINE+x} ]; then
         echo "KERNELSU_VER=$KERNELSU_VER" >"$KERNELSU_INFO"
     fi
     if [ "$GAPPS_BRAND" != "none" ]; then
+        update_gapps_zip_name
         python3 generateGappsLink.py "$ARCH" "$GAPPS_BRAND" "$GAPPS_VARIANT" "$DOWNLOAD_DIR" "$DOWNLOAD_CONF_NAME" "$ANDROID_API" "$GAPPS_ZIP_NAME" || abort
     fi
 
@@ -517,19 +530,17 @@ else # Offline mode
     WSA_MAIN_VER=$(python3 getWSAMainVersion.py "$ARCH" "$WSA_ZIP_PATH")
     if [[ "$WSA_MAIN_VER" -lt 2211 ]]; then
         ANDROID_API=32
-        update_gapps_zip_name
-    fi
-    if [[ "$WSA_MAIN_VER" -ge 2303 ]]; then
-        update_ksu_zip_name
     fi
     declare -A FILES_CHECK_LIST=([WSA_ZIP_PATH]="$WSA_ZIP_PATH" [xaml_PATH]="$xaml_PATH" [vclibs_PATH]="$vclibs_PATH" [UWPVCLibs_PATH]="$UWPVCLibs_PATH")
     if [ "$GAPPS_BRAND" != "none" ] || [ "$ROOT_SOL" = "magisk" ]; then
         FILES_CHECK_LIST+=(["MAGISK_PATH"]="$MAGISK_PATH")
     fi
     if [ "$ROOT_SOL" = "kernelsu" ]; then
+        update_ksu_zip_name
         FILES_CHECK_LIST+=(["KERNELSU_PATH"]="$KERNELSU_PATH")
     fi
     if [ "$GAPPS_BRAND" != 'none' ]; then
+        update_gapps_zip_name
         FILES_CHECK_LIST+=(["GAPPS_PATH"]="$GAPPS_PATH")
     fi
     for i in "${FILES_CHECK_LIST[@]}"; do
@@ -548,9 +559,8 @@ fi
 echo "Extract WSA"
 if [ -f "$WSA_ZIP_PATH" ]; then
     if ! python3 extractWSA.py "$ARCH" "$WSA_ZIP_PATH" "$WORK_DIR" "$WSA_WORK_ENV"; then
-        echo "Unzip WSA failed, is the download incomplete?"
         CLEAN_DOWNLOAD_WSA=1
-        abort
+        abort "Unzip WSA failed, is the download incomplete?"
     fi
     echo -e "Extract done\n"
     # shellcheck disable=SC1090
@@ -566,15 +576,13 @@ if [ "$GAPPS_BRAND" != "none" ] || [ "$ROOT_SOL" = "magisk" ]; then
         MAGISK_VERSION_NAME=""
         MAGISK_VERSION_CODE=0
         if ! python3 extractMagisk.py "$ARCH" "$MAGISK_PATH" "$WORK_DIR"; then
-            echo "Unzip Magisk failed, is the download incomplete?"
             CLEAN_DOWNLOAD_MAGISK=1
-            abort
+            abort "Unzip Magisk failed, is the download incomplete?"
         fi
         # shellcheck disable=SC1090
         source "$WSA_WORK_ENV" || abort
-        if [ "$MAGISK_VERSION_CODE" -lt 25211 ] && [ "$MAGISK_VER" != "stable" ] && [ -z ${CUSTOM_MAGISK+x} ]; then
-            echo "Please install Magisk 25211+"
-            abort
+        if [ "$MAGISK_VERSION_CODE" -lt 26000 ] && [ "$MAGISK_VER" != "stable" ] && [ -z ${CUSTOM_MAGISK+x} ]; then
+            abort "Please install Magisk 26.0+"
         fi
         sudo chmod +x "../linker/$HOST_ARCH/linker64" || abort
         sudo patchelf --set-interpreter "../linker/$HOST_ARCH/linker64" "$WORK_DIR/magisk/magiskpolicy" || abort
@@ -590,13 +598,13 @@ if [ "$GAPPS_BRAND" != "none" ] || [ "$ROOT_SOL" = "magisk" ]; then
 fi
 
 if [ "$ROOT_SOL" = "kernelsu" ]; then
+    update_ksu_zip_name
     echo "Extract KernelSU"
     # shellcheck disable=SC1090
     source "${KERNELSU_INFO:?}" || abort
     if ! unzip "$KERNELSU_PATH" -d "$WORK_DIR/kernelsu"; then
-        echo "Unzip KernelSU failed, package is corrupted?"
         CLEAN_DOWNLOAD_KERNELSU=1
-        abort
+        abort "Unzip KernelSU failed, package is corrupted?"
     fi
     if [ "$ARCH" = "x64" ]; then
         mv "$WORK_DIR/kernelsu/bzImage" "$WORK_DIR/kernelsu/kernel"
@@ -607,28 +615,26 @@ if [ "$ROOT_SOL" = "kernelsu" ]; then
 fi
 
 if [ "$GAPPS_BRAND" != 'none' ]; then
+    update_gapps_zip_name
     echo "Extract $GAPPS_BRAND"
     mkdir -p "$WORK_DIR/gapps" || abort
     if [ -f "$GAPPS_PATH" ]; then
         if [ "$GAPPS_BRAND" = "OpenGApps" ]; then
             if ! unzip -p "$GAPPS_PATH" {Core,GApps}/'*.lz' | tar --lzip -C "$WORK_DIR/gapps" -xf - -i --strip-components=2 --exclude='setupwizardtablet-x86_64' --exclude='packageinstallergoogle-all' --exclude='speech-common' --exclude='markup-lib-arm' --exclude='markup-lib-arm64' --exclude='markup-all' --exclude='setupwizarddefault-x86_64' --exclude='pixellauncher-all' --exclude='pixellauncher-common'; then
-                echo "Unzip OpenGApps failed, is the download incomplete?"
                 CLEAN_DOWNLOAD_GAPPS=1
-                abort
+                abort "Unzip OpenGApps failed, is the download incomplete?"
             fi
         else
             if ! unzip "$GAPPS_PATH" "system/*" -x "system/addon.d/*" "system/system_ext/priv-app/SetupWizard/*" -d "$WORK_DIR/gapps"; then
-                echo "Unzip MindTheGapps failed, package is corrupted?"
                 CLEAN_DOWNLOAD_GAPPS=1
-                abort
+                abort "Unzip MindTheGapps failed, package is corrupted?"
             fi
             mv "$WORK_DIR/gapps/system/"* "$WORK_DIR/gapps" || abort
             rm -rf "${WORK_DIR:?}/gapps/system" || abort
         fi
         cp -r "../$ARCH/gapps/"* "$WORK_DIR/gapps" || abort
     else
-        echo "The $GAPPS_BRAND zip package does not exist."
-        abort
+        abort "The $GAPPS_BRAND zip package does not exist."
     fi
     echo -e "Extract done\n"
 fi
@@ -641,21 +647,22 @@ if [[ "$WSA_MAIN_VER" -ge 2302 ]]; then
     vhdx_to_raw_img "$WORK_DIR/wsa/$ARCH/vendor.vhdx" "$WORK_DIR/wsa/$ARCH/vendor.img" || abort
     echo -e "Convert vhdx to RAW image done\n"
 fi
+
 if [[ "$WSA_MAIN_VER" -ge 2304 ]]; then
     echo "Mount images"
     sudo mkdir -p -m 755 "$ROOT_MNT_RO" || abort
     sudo chown "0:0" "$ROOT_MNT_RO" || abort
     sudo setfattr -n security.selinux -v "u:object_r:rootfs:s0" "$ROOT_MNT_RO" || abort
-    sudo mount -vo loop "$WORK_DIR/wsa/$ARCH/system.img" "$ROOT_MNT_RO" || abort
-    sudo mount -vo loop "$WORK_DIR/wsa/$ARCH/vendor.img" "$VENDOR_MNT_RO" || abort
-    sudo mount -vo loop "$WORK_DIR/wsa/$ARCH/product.img" "$PRODUCT_MNT_RO" || abort
-    sudo mount -vo loop "$WORK_DIR/wsa/$ARCH/system_ext.img" "$SYSTEM_EXT_MNT_RO" || abort
+    mount_erofs "$WORK_DIR/wsa/$ARCH/system.img" "$ROOT_MNT_RO" || abort
+    mount_erofs "$WORK_DIR/wsa/$ARCH/vendor.img" "$VENDOR_MNT_RO" || abort
+    mount_erofs "$WORK_DIR/wsa/$ARCH/product.img" "$PRODUCT_MNT_RO" || abort
+    mount_erofs "$WORK_DIR/wsa/$ARCH/system_ext.img" "$SYSTEM_EXT_MNT_RO" || abort
     echo -e "done\n"
     echo "Create overlayfs for EROFS"
-    mk_overlayfs "$ROOT_MNT_RO" system "$ROOT_MNT" || abort 
-    mk_overlayfs "$VENDOR_MNT_RO" vendor "$VENDOR_MNT" || abort
-    mk_overlayfs "$PRODUCT_MNT_RO" product "$PRODUCT_MNT" || abort
-    mk_overlayfs "$SYSTEM_EXT_MNT_RO" system_ext "$SYSTEM_EXT_MNT" || abort
+    mk_overlayfs system "$ROOT_MNT_RO" "$SYSTEM_MNT_RW" "$ROOT_MNT" || abort 
+    mk_overlayfs vendor "$VENDOR_MNT_RO" "$VENDOR_MNT_RW" "$VENDOR_MNT" || abort
+    mk_overlayfs product "$PRODUCT_MNT_RO" "$PRODUCT_MNT_RW" "$PRODUCT_MNT" || abort
+    mk_overlayfs system_ext "$SYSTEM_EXT_MNT_RO" "$SYSTEM_EXT_MNT_RW" "$SYSTEM_EXT_MNT" || abort
     echo -e "Create overlayfs for EROFS done\n"
 elif [[ "$WSA_MAIN_VER" -ge 2302 ]]; then
     echo "Remove read-only flag for read-only EXT4 image"
@@ -727,6 +734,7 @@ if [ "$REMOVE_AMAZON" ]; then
     echo "Remove Amazon Appstore"
     find "${PRODUCT_MNT:?}"/{etc/permissions,etc/sysconfig,framework,priv-app} 2>/dev/null | grep -e amazon -e venezia | sudo xargs rm -rf
     find "${SYSTEM_EXT_MNT:?}"/{etc/*permissions,framework,priv-app} 2>/dev/null | grep -e amazon -e venezia | sudo xargs rm -rf
+    rm -f "$WORK_DIR/wsa/$ARCH/apex/mado_release.apex"
     echo -e "done\n"
 fi
 
@@ -738,89 +746,82 @@ echo -e "done\n"
 if [ "$ROOT_SOL" = 'magisk' ]; then
     echo "Integrate Magisk"
     sudo cp "$WORK_DIR/magisk/magisk/"* "$ROOT_MNT/debug_ramdisk/"
-    sudo cp "$MAGISK_PATH" "$ROOT_MNT/debug_ramdisk/magisk.apk" || abort
+    sudo cp "$MAGISK_PATH" "$ROOT_MNT/debug_ramdisk/stub.apk" || abort
     sudo tee -a "$ROOT_MNT/debug_ramdisk/loadpolicy.sh" <<EOF >/dev/null || abort
 #!/system/bin/sh
+MAGISKTMP=/debug_ramdisk
+export MAGISKTMP
 mkdir -p /data/adb/magisk
-cp /debug_ramdisk/* /data/adb/magisk/
+cp \$MAGISKTMP/* /data/adb/magisk/
 sync
 chmod -R 755 /data/adb/magisk
 restorecon -R /data/adb/magisk
-for module in \$(ls /data/adb/modules); do
-    if ! [ -f "/data/adb/modules/\$module/disable" ] && [ -f "/data/adb/modules/\$module/sepolicy.rule" ]; then
-        /debug_ramdisk/magiskpolicy --live --apply "/data/adb/modules/\$module/sepolicy.rule"
-    fi
+MAKEDEV=1 \$MAGISKTMP/magisk --preinit-device 2>&1
+RULESCMD=""
+for r in \$MAGISKTMP/.magisk/preinit/*/sepolicy.rule; do
+  [ -f "\$r" ] || continue
+  RULESCMD="\$RULESCMD --apply \$r"
 done
+\$MAGISKTMP/magiskpolicy --live \$RULESCMD 2>&1
 EOF
-    sudo find "$ROOT_MNT/debug_ramdisk" -type f -exec chmod 0755 {} \;
+    sudo find "$ROOT_MNT/debug_ramdisk" -type f -exec chmod 0711 {} \;
     sudo find "$ROOT_MNT/debug_ramdisk" -type f -exec chown root:root {} \;
-    sudo find "$ROOT_MNT/debug_ramdisk" -type f -exec setfattr -n security.selinux -v "u:object_r:system_file:s0" {} \; || abort
-
-    MAGISK_TMP_PATH=$(Gen_Rand_Str 14)
-    echo "/dev/$MAGISK_TMP_PATH(/.*)?    u:object_r:magisk_file:s0" | sudo tee -a "$VENDOR_MNT/etc/selinux/vendor_file_contexts"
+    sudo find "$ROOT_MNT/debug_ramdisk" -type f -exec setfattr -n security.selinux -v "u:object_r:magisk_file:s0" {} \; || abort
+    echo "/debug_ramdisk(/.*)?    u:object_r:magisk_file:s0" | sudo tee -a "$VENDOR_MNT/etc/selinux/vendor_file_contexts"
     echo '/data/adb/magisk(/.*)?   u:object_r:magisk_file:s0' | sudo tee -a "$VENDOR_MNT/etc/selinux/vendor_file_contexts"
     sudo LD_LIBRARY_PATH="../linker/$HOST_ARCH" "$WORK_DIR/magisk/magiskpolicy" --load "$VENDOR_MNT/etc/selinux/precompiled_sepolicy" --save "$VENDOR_MNT/etc/selinux/precompiled_sepolicy" --magisk || abort
-    LOAD_POLICY_SVC_NAME=$(Gen_Rand_Str 12)
-    PFD_SVC_NAME=$(Gen_Rand_Str 12)
-    LS_SVC_NAME=$(Gen_Rand_Str 12)
+    NEW_INITRC_DIR=$SYSTEM_MNT/etc/init/hw
     sudo tee -a "$SYSTEM_MNT/etc/init/hw/init.rc" <<EOF >/dev/null
 on post-fs-data
-    mkdir /dev/$MAGISK_TMP_PATH
-    mount tmpfs tmpfs /dev/$MAGISK_TMP_PATH mode=0755
+    mkdir /dev/debug_ramdisk_mirror
+    mount none /debug_ramdisk /dev/debug_ramdisk_mirror bind
+    mount none none /dev/debug_ramdisk_mirror private
+    mount tmpfs magisk /debug_ramdisk mode=0755
+    copy /dev/debug_ramdisk_mirror/magisk64 /debug_ramdisk/magisk64
+    chmod 0711 /debug_ramdisk/magisk64
+    symlink ./magisk64 /debug_ramdisk/magisk
+    symlink ./magisk64 /debug_ramdisk/su
+    symlink ./magisk64 /debug_ramdisk/resetprop
+    start adbd
+    copy /dev/debug_ramdisk_mirror/magisk32 /debug_ramdisk/magisk32
+    chmod 0711 /debug_ramdisk/magisk32
+    copy /dev/debug_ramdisk_mirror/magiskinit /debug_ramdisk/magiskinit
+    chmod 0711 /debug_ramdisk/magiskinit
+    copy /dev/debug_ramdisk_mirror/magiskpolicy /debug_ramdisk/magiskpolicy
+    chmod 0711 /debug_ramdisk/magiskpolicy
+    mkdir /debug_ramdisk/.magisk
+    mkdir /debug_ramdisk/.magisk/mirror 0
+    mkdir /debug_ramdisk/.magisk/block 0
+    mkdir /debug_ramdisk/.magisk/worker 0
+    copy /dev/debug_ramdisk_mirror/stub.apk /debug_ramdisk/stub.apk
+    chmod 0644 /debug_ramdisk/stub.apk
+    copy /dev/debug_ramdisk_mirror/loadpolicy.sh /debug_ramdisk/loadpolicy.sh
+    chmod 0711 /debug_ramdisk/loadpolicy.sh
+    umount /dev/debug_ramdisk_mirror
+    rmdir /dev/debug_ramdisk_mirror
+    exec u:r:magisk:s0 0 0 -- /system/bin/sh /debug_ramdisk/loadpolicy.sh
+    exec u:r:magisk:s0 0 0 -- /debug_ramdisk/magisk --post-fs-data
 
-    copy /debug_ramdisk/magisk64 /dev/$MAGISK_TMP_PATH/magisk64
-    chmod 0755 /dev/$MAGISK_TMP_PATH/magisk64
-    symlink ./magisk64 /dev/$MAGISK_TMP_PATH/magisk
-    symlink ./magisk64 /dev/$MAGISK_TMP_PATH/su
-    symlink ./magisk64 /dev/$MAGISK_TMP_PATH/resetprop
-    copy /debug_ramdisk/magisk32 /dev/$MAGISK_TMP_PATH/magisk32
-    chmod 0755 /dev/$MAGISK_TMP_PATH/magisk32
-    copy /debug_ramdisk/magiskinit /dev/$MAGISK_TMP_PATH/magiskinit
-    chmod 0755 /dev/$MAGISK_TMP_PATH/magiskinit
-    copy /debug_ramdisk/magiskpolicy /dev/$MAGISK_TMP_PATH/magiskpolicy
-    chmod 0755 /dev/$MAGISK_TMP_PATH/magiskpolicy
-    mkdir /dev/$MAGISK_TMP_PATH/.magisk 755
-    mkdir /dev/$MAGISK_TMP_PATH/.magisk/mirror 0
-    mkdir /dev/$MAGISK_TMP_PATH/.magisk/block 0
-    mkdir /dev/$MAGISK_TMP_PATH/.magisk/worker 0
-    copy /debug_ramdisk/magisk.apk /dev/$MAGISK_TMP_PATH/stub.apk
-    chmod 0644 /dev/$MAGISK_TMP_PATH/stub.apk
+on property:vold.decrypt=trigger_restart_framework
+    exec u:r:magisk:s0 0 0 -- /debug_ramdisk/magisk --service
 
-    rm /dev/.magisk_unblock
-    exec_start $LOAD_POLICY_SVC_NAME
-    start $PFD_SVC_NAME
-    wait /dev/.magisk_unblock 40
-    rm /dev/.magisk_unblock
-    exec u:r:magisk:s0 0 0 -- /system/bin/mknod -m 0600 /dev/$MAGISK_TMP_PATH/.magisk/block/preinit b 8 0
-
-service $LOAD_POLICY_SVC_NAME /system/bin/sh /debug_ramdisk/loadpolicy.sh
-    user root
-    seclabel u:r:magisk:s0
-    oneshot
-
-service $PFD_SVC_NAME /dev/$MAGISK_TMP_PATH/magisk --post-fs-data
-    user root
-    seclabel u:r:magisk:s0
-    oneshot
-
-service $LS_SVC_NAME /dev/$MAGISK_TMP_PATH/magisk --service
-    class late_start
-    user root
-    seclabel u:r:magisk:s0
-    oneshot
+on nonencrypted
+    exec u:r:magisk:s0 0 0 -- /debug_ramdisk/magisk --service
 
 on property:sys.boot_completed=1
-    mkdir /data/adb/magisk 755
-    copy /debug_ramdisk/magisk.apk /data/adb/magisk/magisk.apk
-    exec /dev/$MAGISK_TMP_PATH/magisk --boot-complete
-
-on property:init.svc.zygote=restarting
-    exec /dev/$MAGISK_TMP_PATH/magisk --zygote-restart
+    exec u:r:magisk:s0 0 0 --  /debug_ramdisk/magisk --boot-complete
 
 on property:init.svc.zygote=stopped
-    exec /dev/$MAGISK_TMP_PATH/magisk --zygote-restart
-
+    exec u:r:magisk:s0 0 0 -- /debug_ramdisk/magisk --zygote-restart
 EOF
+
+for i in "$NEW_INITRC_DIR"/*; do
+    if [[ "$i" =~ init.zygote.+\.rc ]]; then
+        echo "Inject zygote restart $i"
+        sudo awk -i inplace '{if($0 ~ /service zygote /){print $0;print "    exec u:r:magisk:s0 0 0 -- /debug_ramdisk/magisk --zygote-restart";a="";next}} 1' "$i"
+    fi
+done
+
     echo -e "Integrate Magisk done\n"
 elif [ "$ROOT_SOL" = "kernelsu" ]; then
     echo "Integrate KernelSU"
@@ -888,7 +889,7 @@ if [ "$GAPPS_BRAND" != 'none' ]; then
         find "$WORK_DIR/gapps/system_ext/priv-app/" -maxdepth 1 -mindepth 1 -printf '%P\n' | xargs -I placeholder sudo find "$SYSTEM_EXT_MNT/priv-app/placeholder" -type f -exec setfattr -n security.selinux -v "u:object_r:system_file:s0" {} \; || abort
     fi
 
-    sudo LD_LIBRARY_PATH="../linker/$HOST_ARCH" "$WORK_DIR/magisk/magiskpolicy" --load "$VENDOR_MNT/etc/selinux/precompiled_sepolicy" --save "$VENDOR_MNT/etc/selinux/precompiled_sepolicy" "allow gmscore_app gmscore_app vsock_socket { create connect write read }" "allow gmscore_app device_config_runtime_native_boot_prop file read" "allow gmscore_app system_server_tmpfs dir search" "allow gmscore_app system_server_tmpfs file open" "allow gmscore_app system_server_tmpfs filesystem getattr" "allow gmscore_app gpu_device dir search" || abort
+    sudo LD_LIBRARY_PATH="../linker/$HOST_ARCH" "$WORK_DIR/magisk/magiskpolicy" --load "$VENDOR_MNT/etc/selinux/precompiled_sepolicy" --save "$VENDOR_MNT/etc/selinux/precompiled_sepolicy" "allow gmscore_app gmscore_app vsock_socket { create connect write read }" "allow gmscore_app device_config_runtime_native_boot_prop file read" "allow gmscore_app system_server_tmpfs dir search" "allow gmscore_app system_server_tmpfs file open" "allow gmscore_app system_server_tmpfs filesystem getattr" "allow gmscore_app gpu_device dir search" "allow gmscore_app media_rw_data_file filesystem getattr" || abort
     echo -e "Integrate $GAPPS_BRAND done\n"
 fi
 
@@ -904,9 +905,9 @@ fi
 
 if [[ "$WSA_MAIN_VER" -ge 2304 ]]; then
     echo "Create EROFS images"
-    mk_erofs_umount "$VENDOR_MNT" "$WORK_DIR/wsa/$ARCH/vendor.img" || abort
-    mk_erofs_umount "$PRODUCT_MNT" "$WORK_DIR/wsa/$ARCH/product.img" || abort
-    mk_erofs_umount "$SYSTEM_EXT_MNT" "$WORK_DIR/wsa/$ARCH/system_ext.img" || abort
+    mk_erofs_umount "$VENDOR_MNT" "$WORK_DIR/wsa/$ARCH/vendor.img" "$VENDOR_MNT_RW" || abort
+    mk_erofs_umount "$PRODUCT_MNT" "$WORK_DIR/wsa/$ARCH/product.img" "$PRODUCT_MNT_RW" || abort
+    mk_erofs_umount "$SYSTEM_EXT_MNT" "$WORK_DIR/wsa/$ARCH/system_ext.img" "$SYSTEM_EXT_MNT_RW" || abort
     mk_erofs_umount "$ROOT_MNT" "$WORK_DIR/wsa/$ARCH/system.img" || abort
     echo -e "Create EROFS images done\n"
     echo "Umount images"
