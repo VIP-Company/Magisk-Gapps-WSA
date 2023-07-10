@@ -28,7 +28,7 @@ if [ "$HOST_ARCH" != "x86_64" ] && [ "$HOST_ARCH" != "aarch64" ]; then
     exit 1
 fi
 cd "$(dirname "$0")" || exit 1
-# export TMPDIR=$(dirname "$PWD")/WORK_DIR_
+# export TMPDIR=$HOME/.cache/wsa
 if [ "$TMPDIR" ] && [ ! -d "$TMPDIR" ]; then
     mkdir -p "$TMPDIR"
 fi
@@ -170,7 +170,6 @@ mk_overlayfs() { # label lowerdir upperdir merged
         upperdir=$upperdir
         workdir=$workdir
         merged=$merged"
-    sudo mkdir -p -m 755 "$workdir" "$upperdir" "$merged"
     case "$1" in
         vendor)
             context="u:object_r:vendor_file:s0"
@@ -185,11 +184,12 @@ mk_overlayfs() { # label lowerdir upperdir merged
             own="0:0"
             ;;
     esac
-    sudo chown -R "$own" "$upperdir" "$workdir" "$merged"
-    sudo setfattr -n security.selinux -v "$context" "$upperdir"
-    sudo setfattr -n security.selinux -v "$context" "$workdir"
-    sudo setfattr -n security.selinux -v "$context" "$merged"
-    sudo mount -vt overlay overlay -olowerdir="$lowerdir",upperdir="$upperdir",workdir="$workdir" "$merged"
+    sudo mkdir -p -m 755 "$workdir" "$upperdir" "$merged" || return 1
+    sudo chown -R "$own" "$upperdir" "$workdir" "$merged" || return 1
+    sudo setfattr -n security.selinux -v "$context" "$upperdir" || return 1
+    sudo setfattr -n security.selinux -v "$context" "$workdir" || return 1
+    sudo setfattr -n security.selinux -v "$context" "$merged" || return 1
+    sudo mount -vt overlay overlay -olowerdir="$lowerdir",upperdir="$upperdir",workdir="$workdir" "$merged" || return 1
 }
 
 mk_erofs_umount() { # dir imgpath upperdir
@@ -221,7 +221,7 @@ mount_erofs() {
 # In Debian /usr/sbin is not in PATH and some utilities in there are in use
 [ -d /usr/sbin ] && export PATH="/usr/sbin:$PATH"
 # In Debian /etc/mtab is not exist
-[ -f /etc/mtab ] || ln -s /proc/self/mounts /etc/mtab
+[ -f /etc/mtab ] || sudo ln -s /proc/self/mounts /etc/mtab
 
 ARCH_MAP=(
     "x64"
@@ -479,12 +479,12 @@ update_gapps_zip_name() {
 }
 WSA_MAJOR_VER=0
 update_ksu_zip_name() {
-    KERNEL_VER="5.15.78.1"
-    if [ "$WSA_MAJOR_VER" -lt "2303" ]; then
-        abort "KernelSU is not supported on WSA version below 2303"
+    KERNEL_VER="5.15.94.4"
+    if [ "$WSA_MAJOR_VER" -lt "2304" ]; then
+        abort "KernelSU is not supported on WSA version below 2304"
     fi
-    if [ "$WSA_MAJOR_VER" -ge "2304" ]; then
-        KERNEL_VER="5.15.94.4"
+    if [ "$WSA_MAJOR_VER" -ge "2306" ]; then
+        KERNEL_VER="5.15.104.1"
     fi
     KERNELSU_ZIP_NAME=kernelsu-$ARCH-$KERNEL_VER.zip
     KERNELSU_PATH=$DOWNLOAD_DIR/$KERNELSU_ZIP_NAME
@@ -844,10 +844,10 @@ if [ "$GAPPS_BRAND" != 'none' ]; then
     echo "Integrate $GAPPS_BRAND"
     find "$WORK_DIR/gapps/" -mindepth 1 -type d -exec sudo chmod 0755 {} \;
     find "$WORK_DIR/gapps/" -mindepth 1 -type d -exec sudo chown root:root {} \;
-    file_list="$(find "$WORK_DIR/gapps/" -mindepth 1 -type f | cut -d/ -f5-)"
+    file_list="$(find "$WORK_DIR/gapps/" -mindepth 1 -type f)"
     for file in $file_list; do
-        sudo chown root:root "$WORK_DIR/gapps/${file}"
-        sudo chmod 0644 "$WORK_DIR/gapps/${file}"
+        sudo chown root:root "$file"
+        sudo chmod 0644 "$file"
     done
 
     if [ "$GAPPS_BRAND" = "OpenGApps" ]; then
